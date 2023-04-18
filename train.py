@@ -11,8 +11,10 @@ from lora_utils.insert_lora import get_lora_model
 
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModel
-from accelerate import Accelerator, DeepSpeedPlugin
+# from accelerate import Accelerator, DeepSpeedPlugin
+import accelerate
 from transformers import get_linear_schedule_with_warmup
+# from torch.utils.data import DataLoader
 
 
 
@@ -29,16 +31,16 @@ lora_config = {
 }
 
 LR = 1e-4
-BATCH = 1
+BATCH_SIZE = 1 #两边都会乘上
 MAX_LENGTH = 256
 NUM_EPOCHS = 3
-accumulate_step = 8
+accumulate_step = 4 # 这个数好像 
 warm_up_ratio = 0.1
 
 
 
-deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=accumulate_step)
-accelerator = Accelerator(mixed_precision=mixed_precision, deepspeed_plugin=deepspeed_plugin, log_with="tensorboard", project_dir='runs/')
+deepspeed_plugin = accelerate.DeepSpeedPlugin(gradient_accumulation_steps=accumulate_step)
+accelerator = accelerate.Accelerator(mixed_precision=mixed_precision, deepspeed_plugin=deepspeed_plugin, log_with="tensorboard", project_dir='runs/')
 device = accelerator.device
 
 
@@ -69,16 +71,59 @@ import dataset.Alpaca as Alpaca_Data
 dataset.GLM.device = device
 
 
-accelerator.print('Start to process data')
 
+from transformers import AutoConfig
+config = AutoConfig.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True, revision = 'main')
+# config 是直接载入的
+# pad_to = 1
+# device = ' ckqoisjfgaosijgf'# 会在父文件赋值
+eos_id = config.eos_token_id
+pad_token_id = config.pad_token_id
+pad_to = 1
+def collate_fn(batch):
+    global device
+    input_ids = []
+    labels = []
+    position_ids = []
+    # padding 其实如果为1的话就不需要
+    
+    _max_length = max([len(obj['prompt'])+len(obj['completion']) for obj in batch])
+    # _max_length = (_max_length // pad_to + (_max_length % pad_to > 0) ) * pad_to
 
+    attention_mask = torch.ones((len(batch), _max_length, _max_length), device=device)
+    attention_mask.tril_()
 
+    for i, obj in enumerate(batch):
+        context_length = obj['prompt'].index(130004)
+        attention_mask[i, :, :context_length] = 1
+
+        to_pad = _max_length - len(obj['prompt']) - len(obj['completion'])
+
+        input_ids.append(obj['prompt'] + obj['completion'] + [pad_token_id] * to_pad)
+
+        position_ids.append(torch.stack([torch.arange(0, _max_length, device=device), 
+                                         torch.concat([torch.zeros(context_length - 1, device=device), 
+                                                       torch.arange(0, _max_length - context_length + 1, device=device)])]).long())
+
+        labels.append(torch.tensor([-100] * len(obj['prompt']) + 
+                                   obj['completion'] +
+                                   [-100] * to_pad, device=device).long())
+
+    attention_mask.unsqueeze_(1)
+    attention_mask = (attention_mask < 0.5).bool()
+    return {'input_ids': torch.tensor(input_ids).long(), 
+            'attention_mask': attention_mask, 
+            'labels': torch.stack(labels),
+            'position_ids':torch.stack(position_ids)}
+max_memory=accelerate.utils.get_max_memory()
+accelerator.print("max_memory",max_memory,f"device= {device} ，{accelerator.device}")
 with accelerator.main_process_first():
+    accelerator.print('Start to process data')
     pairs = Alpaca_Data.load('./data/alpaca_data.json')
     pairs_encoded = dataset.GLM.encode_pairs(pairs, tokenizer)
     pairs_encoded = list(filter(lambda pair: len(pair['prompt'])+len(pair['completion']) <= MAX_LENGTH, pairs_encoded))
 train_dataset = dataset.GLM.SimpleDataset(pairs_encoded)
-train_dataloader = DataLoader(dataset=train_dataset, collate_fn = dataset.GLM.collate_fn, shuffle=True, batch_size=BATCH)
+train_dataloader = DataLoader(dataset=train_dataset, collate_fn = collate_fn, shuffle=True, batch_size=BATCH_SIZE)
 
 
 
@@ -96,7 +141,7 @@ model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, op
 
 
 
-
+accelerator.print('Start to train')
 accelerator.init_trackers(model_id, {})
 
 total_effective_step = 0
